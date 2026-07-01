@@ -119,8 +119,16 @@ impl<'tcx> SpanMapVisitor<'tcx> {
     /// [^1]: Historical context:
     /// <https://github.com/rust-lang/rust/issues/69426#issuecomment-1019412352>.
     fn maybe_typeck_results(&mut self) -> Option<&'tcx ty::TypeckResults<'tcx>> {
+        let tcx = self.tcx;
         let results = self.maybe_typeck_results.as_mut()?;
-        let results = results.cache.get_or_insert_with(|| self.tcx.typeck_body(results.body_id));
+        if *results.has_resolution_errors.get_or_insert_with(|| {
+            let mut visitor = HasResolutionErrors { tcx, has_errors: false };
+            visitor.visit_body(tcx.hir_body(results.body_id));
+            visitor.has_errors
+        }) {
+            return None;
+        }
+        let results = results.cache.get_or_insert_with(|| tcx.typeck_body(results.body_id));
         Some(results)
     }
 
@@ -245,8 +253,11 @@ impl<'tcx> Visitor<'tcx> for SpanMapVisitor<'tcx> {
     }
 
     fn visit_nested_body(&mut self, body_id: hir::BodyId) -> Self::Result {
-        let maybe_typeck_results =
-            self.maybe_typeck_results.replace(LazyTypeckResults { body_id, cache: None });
+        let maybe_typeck_results = self.maybe_typeck_results.replace(LazyTypeckResults {
+            body_id,
+            has_resolution_errors: None,
+            cache: None,
+        });
         self.visit_body(self.tcx.hir_body(body_id));
         self.maybe_typeck_results = maybe_typeck_results;
     }
@@ -379,5 +390,24 @@ impl<'tcx> Visitor<'tcx> for SpanMapVisitor<'tcx> {
 /// Lazily computed & cached [`ty::TypeckResults`].
 struct LazyTypeckResults<'tcx> {
     body_id: hir::BodyId,
+    has_resolution_errors: Option<bool>,
     cache: Option<&'tcx ty::TypeckResults<'tcx>>,
+}
+
+struct HasResolutionErrors<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    has_errors: bool,
+}
+
+impl<'tcx> Visitor<'tcx> for HasResolutionErrors<'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
+
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
+    }
+
+    fn visit_path(&mut self, path: &hir::Path<'tcx>, _id: HirId) {
+        self.has_errors |= path.res == Res::Err;
+        intravisit::walk_path(self, path);
+    }
 }
